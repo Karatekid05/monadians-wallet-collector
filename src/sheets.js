@@ -30,8 +30,22 @@ const auth = new google.auth.JWT({
 
 const sheetsApi = google.sheets({ version: 'v4', auth });
 
-const SHEET_NAME = 'Wallets';
+// Three separate sheets, one per role priority
+const SHEET_NAMES = {
+	MONADIANS: 'Monadians',
+	MONARCH: 'Monarch',
+	MONALISTA: 'Monalista',
+};
 const HEADER_ROW = ['Discord Username', 'Discord ID', 'EVM Wallet', 'Role'];
+
+// Map role labels to sheet names
+function getSheetNameForRole(role) {
+	const normalized = (role || '').toLowerCase();
+	if (normalized === 'monadian') return SHEET_NAMES.MONADIANS;
+	if (normalized === 'monarch') return SHEET_NAMES.MONARCH;
+	if (normalized === 'monalista') return SHEET_NAMES.MONALISTA;
+	return null; // no sheet for users without these roles
+}
 
 async function callWithRetry(requestFn, description = 'Sheets API call') {
 	const maxAttempts = 5;
@@ -54,57 +68,84 @@ async function callWithRetry(requestFn, description = 'Sheets API call') {
 }
 
 export async function ensureSheetSetup() {
-	// Ensure sheet exists and has header row
+	// Ensure all three sheets exist with headers
 	const spreadsheetId = GOOGLE_SHEETS_SPREADSHEET_ID;
-	// Try to get sheet by name
 	const spreadsheet = await callWithRetry(() => sheetsApi.spreadsheets.get({ spreadsheetId }), 'spreadsheets.get');
-	const sheetExists = spreadsheet.data.sheets?.some(
-		(s) => s.properties?.title === SHEET_NAME
+	
+	const existingSheets = new Set(
+		spreadsheet.data.sheets?.map((s) => s.properties?.title) || []
 	);
-	if (!sheetExists) {
+	
+	// Create any missing sheets
+	const sheetsToCreate = [];
+	for (const sheetName of Object.values(SHEET_NAMES)) {
+		if (!existingSheets.has(sheetName)) {
+			sheetsToCreate.push({ addSheet: { properties: { title: sheetName } } });
+		}
+	}
+	
+	if (sheetsToCreate.length > 0) {
 		await callWithRetry(() => sheetsApi.spreadsheets.batchUpdate({
 			spreadsheetId,
-			requestBody: {
-				requests: [
-					{ addSheet: { properties: { title: SHEET_NAME } } },
-				],
-			},
-		}), 'spreadsheets.batchUpdate');
+			requestBody: { requests: sheetsToCreate },
+		}), 'spreadsheets.batchUpdate create sheets');
 	}
-	// Write header row if first row is empty
-	const range = `${SHEET_NAME}!A1:D1`;
-	const current = await callWithRetry(() => sheetsApi.spreadsheets.values.get({ spreadsheetId, range }), 'values.get header');
-	const firstRow = current.data.values?.[0] ?? [];
-	if (firstRow.length === 0 || HEADER_ROW.some((h, i) => firstRow[i] !== h)) {
-		await callWithRetry(() => sheetsApi.spreadsheets.values.update({
-			spreadsheetId,
-			range,
-			valueInputOption: 'RAW',
-			requestBody: { values: [HEADER_ROW] },
-		}), 'values.update header');
+	
+	// Write header row for each sheet if needed
+	for (const sheetName of Object.values(SHEET_NAMES)) {
+		const range = `${sheetName}!A1:D1`;
+		const current = await callWithRetry(() => sheetsApi.spreadsheets.values.get({ spreadsheetId, range }), 'values.get header');
+		const firstRow = current.data.values?.[0] ?? [];
+		if (firstRow.length === 0 || HEADER_ROW.some((h, i) => firstRow[i] !== h)) {
+			await callWithRetry(() => sheetsApi.spreadsheets.values.update({
+				spreadsheetId,
+				range,
+				valueInputOption: 'RAW',
+				requestBody: { values: [HEADER_ROW] },
+			}), 'values.update header');
+		}
 	}
 }
 
 export async function upsertWallet({ discordId, discordUsername, wallet, role }) {
 	await ensureSheetSetup();
 	const spreadsheetId = GOOGLE_SHEETS_SPREADSHEET_ID;
-	const range = `${SHEET_NAME}!A2:D`; // data rows
-	const resp = await callWithRetry(() => sheetsApi.spreadsheets.values.get({ spreadsheetId, range }), 'values.get upsert');
-	const rows = resp.data.values || [];
-
-	let rowIndex = -1; // 0-based within rows (A2 is index 0)
-	for (let i = 0; i < rows.length; i++) {
-		if (rows[i][1] === discordId) {
-			rowIndex = i;
-			break;
-		}
+	
+	const targetSheet = getSheetNameForRole(role);
+	if (!targetSheet) {
+		// User doesn't have any priority role, don't save
+		return { action: 'skipped', reason: 'no_priority_role' };
 	}
-
-	if (rowIndex === -1) {
-		// append
+	
+	// Check all sheets to see if user exists elsewhere
+	let existingLocation = null;
+	for (const sheetName of Object.values(SHEET_NAMES)) {
+		const range = `${sheetName}!A2:D`;
+		const resp = await callWithRetry(() => sheetsApi.spreadsheets.values.get({ spreadsheetId, range }), 'values.get check');
+		const rows = resp.data.values || [];
+		
+		for (let i = 0; i < rows.length; i++) {
+			if (rows[i][1] === discordId) {
+				existingLocation = { sheetName, rowNumber: i + 2 };
+				break;
+			}
+		}
+		if (existingLocation) break;
+	}
+	
+	// If user exists in a different sheet, delete from old sheet
+	if (existingLocation && existingLocation.sheetName !== targetSheet) {
+		await deleteRowFromSheet(existingLocation.sheetName, existingLocation.rowNumber);
+		existingLocation = null; // treat as new insert
+	}
+	
+	const targetRange = `${targetSheet}!A2:D`;
+	
+	if (!existingLocation) {
+		// Insert new row in target sheet
 		await callWithRetry(() => sheetsApi.spreadsheets.values.append({
 			spreadsheetId,
-			range,
+			range: targetRange,
 			valueInputOption: 'RAW',
 			insertDataOption: 'INSERT_ROWS',
 			requestBody: {
@@ -113,9 +154,9 @@ export async function upsertWallet({ discordId, discordUsername, wallet, role })
 		}), 'values.append upsert');
 		return { action: 'inserted' };
 	}
-
-	// update existing row
-	const updateRange = `${SHEET_NAME}!A${rowIndex + 2}:D${rowIndex + 2}`;
+	
+	// Update existing row in same sheet
+	const updateRange = `${targetSheet}!A${existingLocation.rowNumber}:D${existingLocation.rowNumber}`;
 	await callWithRetry(() => sheetsApi.spreadsheets.values.update({
 		spreadsheetId,
 		range: updateRange,
@@ -127,15 +168,44 @@ export async function upsertWallet({ discordId, discordUsername, wallet, role })
 	return { action: 'updated' };
 }
 
+// Helper function to delete a row from a specific sheet
+async function deleteRowFromSheet(sheetName, rowNumber) {
+	const spreadsheetId = GOOGLE_SHEETS_SPREADSHEET_ID;
+	const spreadsheet = await callWithRetry(() => sheetsApi.spreadsheets.get({ spreadsheetId }), 'spreadsheets.get');
+	const sheet = spreadsheet.data.sheets?.find((s) => s.properties?.title === sheetName);
+	if (!sheet) return;
+	
+	const sheetId = sheet.properties.sheetId;
+	await callWithRetry(() => sheetsApi.spreadsheets.batchUpdate({
+		spreadsheetId,
+		requestBody: {
+			requests: [{
+				deleteDimension: {
+					range: {
+						sheetId: sheetId,
+						dimension: 'ROWS',
+						startIndex: rowNumber - 1,
+						endIndex: rowNumber,
+					},
+				},
+			}],
+		},
+	}), 'spreadsheets.batchUpdate delete row');
+}
+
 export async function getWallet(discordId) {
 	await ensureSheetSetup();
 	const spreadsheetId = GOOGLE_SHEETS_SPREADSHEET_ID;
-	const range = `${SHEET_NAME}!A2:D`;
-	const resp = await callWithRetry(() => sheetsApi.spreadsheets.values.get({ spreadsheetId, range }), 'values.get getWallet');
-	const rows = resp.data.values || [];
-	for (const row of rows) {
-		if (row[1] === discordId) {
-			return { discordUsername: row[0], discordId: row[1], wallet: row[2], role: row[3] ?? '' };
+	
+	// Search across all three sheets
+	for (const sheetName of Object.values(SHEET_NAMES)) {
+		const range = `${sheetName}!A2:D`;
+		const resp = await callWithRetry(() => sheetsApi.spreadsheets.values.get({ spreadsheetId, range }), 'values.get getWallet');
+		const rows = resp.data.values || [];
+		for (const row of rows) {
+			if (row[1] === discordId) {
+				return { discordUsername: row[0], discordId: row[1], wallet: row[2], role: row[3] ?? '' };
+			}
 		}
 	}
 	return null;
@@ -144,18 +214,22 @@ export async function getWallet(discordId) {
 export async function listWallets() {
 	await ensureSheetSetup();
 	const spreadsheetId = GOOGLE_SHEETS_SPREADSHEET_ID;
-	const range = `${SHEET_NAME}!A2:D`;
-	const resp = await callWithRetry(() => sheetsApi.spreadsheets.values.get({ spreadsheetId, range }), 'values.get list');
-	const rows = resp.data.values || [];
 	const items = [];
-	for (const row of rows) {
-		if (!row || row.length === 0) continue;
-		items.push({
-			discordUsername: row[0] ?? '',
-			discordId: row[1] ?? '',
-			wallet: row[2] ?? '',
-			role: row[3] ?? '',
-		});
+	
+	// Collect from all three sheets
+	for (const sheetName of Object.values(SHEET_NAMES)) {
+		const range = `${sheetName}!A2:D`;
+		const resp = await callWithRetry(() => sheetsApi.spreadsheets.values.get({ spreadsheetId, range }), 'values.get list');
+		const rows = resp.data.values || [];
+		for (const row of rows) {
+			if (!row || row.length === 0) continue;
+			items.push({
+				discordUsername: row[0] ?? '',
+				discordId: row[1] ?? '',
+				wallet: row[2] ?? '',
+				role: row[3] ?? '',
+			});
+		}
 	}
 	return items;
 }
@@ -163,90 +237,116 @@ export async function listWallets() {
 export async function listWalletsWithRow() {
 	await ensureSheetSetup();
 	const spreadsheetId = GOOGLE_SHEETS_SPREADSHEET_ID;
-	const range = `${SHEET_NAME}!A2:D`;
-	const resp = await callWithRetry(() => sheetsApi.spreadsheets.values.get({ spreadsheetId, range }), 'values.get listWithRow');
-	const rows = resp.data.values || [];
 	const items = [];
-	for (let i = 0; i < rows.length; i++) {
-		const row = rows[i] || [];
-		if (row.length === 0) continue;
-		items.push({
-			rowNumber: i + 2, // actual sheet row number
-			discordUsername: row[0] ?? '',
-			discordId: row[1] ?? '',
-			wallet: row[2] ?? '',
-			role: row[3] ?? '',
-		});
+	
+	// Collect from all three sheets with sheet info
+	for (const sheetName of Object.values(SHEET_NAMES)) {
+		const range = `${sheetName}!A2:D`;
+		const resp = await callWithRetry(() => sheetsApi.spreadsheets.values.get({ spreadsheetId, range }), 'values.get listWithRow');
+		const rows = resp.data.values || [];
+		for (let i = 0; i < rows.length; i++) {
+			const row = rows[i] || [];
+			if (row.length === 0) continue;
+			items.push({
+				sheetName: sheetName,
+				rowNumber: i + 2, // actual sheet row number
+				discordUsername: row[0] ?? '',
+				discordId: row[1] ?? '',
+				wallet: row[2] ?? '',
+				role: row[3] ?? '',
+			});
+		}
 	}
 	return items;
 }
 
+// This function is now handled by upsertWallet which manages cross-sheet moves
 export async function updateRole(discordId, role) {
-	await ensureSheetSetup();
-	const spreadsheetId = GOOGLE_SHEETS_SPREADSHEET_ID;
-	const range = `${SHEET_NAME}!A2:D`;
-	const resp = await callWithRetry(() => sheetsApi.spreadsheets.values.get({ spreadsheetId, range }), 'values.get updateRole');
-	const rows = resp.data.values || [];
-
-	let rowIndex = -1;
-	for (let i = 0; i < rows.length; i++) {
-		if (rows[i][1] === discordId) {
-			rowIndex = i;
-			break;
-		}
-	}
-	if (rowIndex === -1) return false;
-
-	const updateRange = `${SHEET_NAME}!D${rowIndex + 2}:D${rowIndex + 2}`;
-	await callWithRetry(() => sheetsApi.spreadsheets.values.update({
-		spreadsheetId,
-		range: updateRange,
-		valueInputOption: 'RAW',
-		requestBody: {
-			values: [[role ?? '']],
-		},
-	}), 'values.update role');
+	// Find existing record
+	const existing = await getWallet(discordId);
+	if (!existing) return false;
+	
+	// Use upsertWallet to handle potential sheet migration
+	await upsertWallet({
+		discordId,
+		discordUsername: existing.discordUsername,
+		wallet: existing.wallet,
+		role,
+	});
 	return true;
 }
 
+// New batch update that handles cross-sheet migrations
 export async function batchUpdateRoles(updates) {
-	if (!Array.isArray(updates) || updates.length === 0) return { updated: 0 };
+	if (!Array.isArray(updates) || updates.length === 0) return { updated: 0, moved: 0 };
 	await ensureSheetSetup();
-	const spreadsheetId = GOOGLE_SHEETS_SPREADSHEET_ID;
-	const data = updates.map((u) => ({
-		range: `${SHEET_NAME}!D${u.rowNumber}:D${u.rowNumber}`,
-		values: [[u.role ?? '']],
-	}));
-	await callWithRetry(() => sheetsApi.spreadsheets.values.batchUpdate({
-		spreadsheetId,
-		requestBody: {
-			valueInputOption: 'RAW',
-			data,
-		},
-	}), 'values.batchUpdate roles');
-	return { updated: updates.length };
+	
+	let updated = 0;
+	let moved = 0;
+	
+	// Process each update individually to handle sheet migrations
+	for (const update of updates) {
+		const { sheetName, rowNumber, discordId, discordUsername, wallet, newRole } = update;
+		const targetSheet = getSheetNameForRole(newRole);
+		
+		if (!targetSheet) {
+			// User no longer has priority role, delete from current sheet
+			await deleteRowFromSheet(sheetName, rowNumber);
+			updated++;
+			continue;
+		}
+		
+		if (sheetName !== targetSheet) {
+			// Need to move to different sheet
+			await deleteRowFromSheet(sheetName, rowNumber);
+			await upsertWallet({ discordId, discordUsername, wallet, role: newRole });
+			moved++;
+		} else {
+			// Just update role in same sheet
+			const spreadsheetId = GOOGLE_SHEETS_SPREADSHEET_ID;
+			const updateRange = `${sheetName}!D${rowNumber}:D${rowNumber}`;
+			await callWithRetry(() => sheetsApi.spreadsheets.values.update({
+				spreadsheetId,
+				range: updateRange,
+				valueInputOption: 'RAW',
+				requestBody: {
+					values: [[newRole ?? '']],
+				},
+			}), 'values.update role');
+			updated++;
+		}
+	}
+	
+	return { updated, moved };
 }
 
-export async function batchDeleteRows(rowNumbers) {
+// Updated to work with items that have sheetName and rowNumber
+export async function batchDeleteRows(items) {
 	await ensureSheetSetup();
-	const spreadsheetId = GOOGLE_SHEETS_SPREADSHEET_ID;
-	const sorted = Array.from(new Set(rowNumbers.filter((n) => Number.isInteger(n) && n >= 2))).sort((a,b) => b - a);
-	if (sorted.length === 0) return { deleted: 0 };
-	const requests = sorted.map((rowNumber) => ({
-		deleteDimension: {
-			range: {
-				sheetId: undefined,
-				dimension: 'ROWS',
-				startIndex: rowNumber - 1, // 0-based
-				endIndex: rowNumber,      // exclusive
-			},
-		},
-	}));
-	await callWithRetry(() => sheetsApi.spreadsheets.batchUpdate({
-		spreadsheetId,
-		requestBody: { requests },
-	}), 'spreadsheets.batchUpdate deleteRows');
-	return { deleted: sorted.length };
+	if (!Array.isArray(items) || items.length === 0) return { deleted: 0 };
+	
+	let deleted = 0;
+	
+	// Group by sheet for efficient deletion
+	const bySheet = {};
+	for (const item of items) {
+		const { sheetName, rowNumber } = item;
+		if (!sheetName || !Number.isInteger(rowNumber) || rowNumber < 2) continue;
+		if (!bySheet[sheetName]) bySheet[sheetName] = [];
+		bySheet[sheetName].push(rowNumber);
+	}
+	
+	// Delete from each sheet (in reverse order to avoid shifting row numbers)
+	for (const [sheetName, rowNumbers] of Object.entries(bySheet)) {
+		const sorted = Array.from(new Set(rowNumbers)).sort((a, b) => b - a);
+		for (const rowNumber of sorted) {
+			await deleteRowFromSheet(sheetName, rowNumber);
+			deleted++;
+		}
+	}
+	
+	return { deleted };
 }
+
 
 

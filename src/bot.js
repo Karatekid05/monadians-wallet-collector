@@ -10,19 +10,11 @@ if (!token || !clientId) {
 	process.exit(1);
 }
 
-// Role priority (highest to lowest)
+// Role priority (highest to lowest) - labels match sheet names
 const PRIORITY_ROLES = [
-	{ id: '1338964285585621094', label: 'Admin' },
-	{ id: '1338993206112817283', label: 'Community Team' },
-    { id: '1353403238241669132', label: 'Boss' },
-    { id: '1353017567345901589', label: "Mongang's friends" },
-    { id: '1399886358096379964', label: 'Alpha' },
-    { id: '1416902471124652204', label: 'Free Mint Pass' },
-    { id: '1353403039200972830', label: 'Mafia' },
-    { id: '1353402893532659732', label: 'Capo' },
-    { id: '1353402683247165561', label: 'Fast Shooter' },
-    { id: '1385211569872310324', label: 'Mongang Lover' },
-	{ id: '1427682447369437284', label: 'Monad Eligible' },
+	{ id: '1184443552571338792', label: 'Monadian' },
+	{ id: '1316432197162631238', label: 'Monarch' },
+	{ id: '1184772610102394950', label: 'Monalista' },
 ];
 
 async function getMemberRoleIds(interaction) {
@@ -152,27 +144,44 @@ client.on('interactionCreate', async (interaction) => {
 							try {
 								const member = await interaction.guild?.members.fetch(item.discordId).catch(() => null);
 								const role = await getHighestPriorityRoleLabel({ guild: interaction.guild, user: { id: item.discordId }, member });
-								computed.push({ rowNumber: item.rowNumber, discordId: item.discordId, newRole: role || '' });
+								computed.push({ 
+									sheetName: item.sheetName,
+									rowNumber: item.rowNumber, 
+									discordId: item.discordId,
+									discordUsername: item.discordUsername,
+									wallet: item.wallet,
+									newRole: role || '' 
+								});
 							} catch {
-								computed.push({ rowNumber: item.rowNumber, discordId: item.discordId, newRole: '' });
+								computed.push({ 
+									sheetName: item.sheetName,
+									rowNumber: item.rowNumber, 
+									discordId: item.discordId,
+									discordUsername: item.discordUsername,
+									wallet: item.wallet,
+									newRole: '' 
+								});
 							}
 						}
 					});
 					await Promise.all(workers);
-					// Only write differences to reduce API calls
+					// Only write differences or moves to reduce API calls
 					const diffs = computed
 						.map((c) => {
-							const existing = items.find((i) => i.rowNumber === c.rowNumber);
-							return existing && (existing.role || '') !== c.newRole ? { rowNumber: c.rowNumber, role: c.newRole } : null;
+							const existing = items.find((i) => i.discordId === c.discordId);
+							// Check if role changed or needs to move to different sheet
+							return existing && (existing.role || '') !== c.newRole ? c : null;
 						})
 						.filter(Boolean);
 					let updated = 0;
+					let moved = 0;
 					if (diffs.length > 0) {
-						const { updated: count } = await batchUpdateRoles(diffs);
-						updated = count;
+						const result = await batchUpdateRoles(diffs);
+						updated = result.updated || 0;
+						moved = result.moved || 0;
 					}
 					try {
-						await interaction.user.send(`Roles refreshed for ${updated} user(s).`);
+						await interaction.user.send(`Roles refreshed: ${updated} updated, ${moved} moved between sheets.`);
 					} catch {}
 				})();
 			}
@@ -194,7 +203,14 @@ client.on('interactionCreate', async (interaction) => {
 								const member = await interaction.guild?.members.fetch(item.discordId).catch(() => null);
 								const hasRole = !!member?.roles?.cache?.has(ROLE_ID);
 								if (hasRole) {
-									updates.push({ rowNumber: item.rowNumber, role: 'Monad Airdrop' });
+									updates.push({ 
+										sheetName: item.sheetName,
+										rowNumber: item.rowNumber,
+										discordId: item.discordId,
+										discordUsername: item.discordUsername,
+										wallet: item.wallet,
+										newRole: 'Monad Airdrop'
+									});
 								}
 							} catch {}
 						}
@@ -202,8 +218,8 @@ client.on('interactionCreate', async (interaction) => {
 					await Promise.all(workers);
 					let updated = 0;
 					if (updates.length > 0) {
-						const { updated: count } = await batchUpdateRoles(updates);
-						updated = count;
+						const result = await batchUpdateRoles(updates);
+						updated = result.updated || 0;
 					}
 					try {
 						await interaction.user.send(`Monad Airdrop set for ${updated} user(s).`);
@@ -227,7 +243,7 @@ client.on('interactionCreate', async (interaction) => {
 								const roleIds = new Set(member?.roles?.cache?.map((r) => r.id) || []);
 								const hasAnyPriority = PRIORITY_ROLES.some((r) => roleIds.has(r.id));
 								if (!hasAnyPriority) {
-									toDelete.push(item.rowNumber);
+									toDelete.push({ sheetName: item.sheetName, rowNumber: item.rowNumber });
 								}
 							} catch {}
 						}
