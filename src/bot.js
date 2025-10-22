@@ -78,10 +78,6 @@ async function registerCommands() {
 			description: 'Refresh stored roles for submitted wallets',
 		},
 		{
-			name: 'fill-monad-airdrop-role',
-			description: 'Fill blank roles with Monad Airdrop if user has that role',
-		},
-		{
 			name: 'prune-no-priority-roles',
 			description: 'Remove sheet entries for users without any priority role',
 		},
@@ -182,47 +178,6 @@ client.on('interactionCreate', async (interaction) => {
 					}
 					try {
 						await interaction.user.send(`Roles refreshed: ${updated} updated, ${moved} moved between sheets.`);
-					} catch {}
-				})();
-			}
-			if (interaction.commandName === 'fill-monad-airdrop-role') {
-				await interaction.deferReply({ ephemeral: true });
-				const ROLE_ID = '1427682447369437284';
-				const items = await listWalletsWithRow();
-				const targets = items.filter((i) => (i.role || '') === '');
-				await interaction.editReply(`Checking ${targets.length} user(s) with blank role. I'll DM you when done.`);
-				(async () => {
-					const concurrencyLimit = 5;
-					const queue = [...targets];
-					const updates = [];
-					const workers = Array.from({ length: concurrencyLimit }, async () => {
-						while (queue.length > 0) {
-							const item = queue.shift();
-							if (!item || !item.discordId) continue;
-							try {
-								const member = await interaction.guild?.members.fetch(item.discordId).catch(() => null);
-								const hasRole = !!member?.roles?.cache?.has(ROLE_ID);
-								if (hasRole) {
-									updates.push({ 
-										sheetName: item.sheetName,
-										rowNumber: item.rowNumber,
-										discordId: item.discordId,
-										discordUsername: item.discordUsername,
-										wallet: item.wallet,
-										newRole: 'Monad Airdrop'
-									});
-								}
-							} catch {}
-						}
-					});
-					await Promise.all(workers);
-					let updated = 0;
-					if (updates.length > 0) {
-						const result = await batchUpdateRoles(updates);
-						updated = result.updated || 0;
-					}
-					try {
-						await interaction.user.send(`Monad Airdrop set for ${updated} user(s).`);
 					} catch {}
 				})();
 			}
